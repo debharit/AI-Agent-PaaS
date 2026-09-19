@@ -1,183 +1,144 @@
-import logging
+"""
+The web interface, built with gradio.
+"""
+
 from pathlib import Path
 
 import gradio as gr
 
-from integrations import trivia_api
-from integrations.agy_questions import ask_anything, evaluate_answer, fetch_web_questions
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+from integrations.agy_questions import (
+    ask_anything,
+    evaluate_answer,
+    fetch_web_questions,
 )
-logger = logging.getLogger("antigravity_interface")
+from integrations.trivia_api import fetch_questions
 
-STATE_QUESTIONS = "questions"
-STATE_INDEX = "index"
-STATE_SCORE = "score"
-
-SOURCE_OPENTDB = "Open Trivia DB"
-SOURCE_WEB = "Web Search (agy)"
-RAG_DIR = PROJECT_ROOT / "rag"
-
-# Long documents make the agent slow, so send it a generous but bounded slice.
+RAG_FOLDER = Path("rag")
 MAX_CONTEXT_CHARS = 30_000
+DEFAULT_QUESTIONS = 5
+
+
+def new_state() -> dict:
+    """The state of a session with no quiz running."""
+    return {"questions": [], "index": 0, "score": 0}
 
 
 def read_documents() -> str:
-    """The text of every .txt file in rag/, labelled by filename."""
+    """Read every .txt file in rag/ into one string."""
     parts = []
-
-    for path in sorted(RAG_DIR.glob("*.txt")):
-        parts.append(f"--- {path.name} ---\n{path.read_text(encoding='utf-8', errors='replace')}")
-
+    for path in sorted(RAG_FOLDER.glob("*.txt")):
+        parts.append(f"--- {path.name} ---\n{path.read_text(encoding='utf-8')}")
     return "\n\n".join(parts)[:MAX_CONTEXT_CHARS]
 
-
-def format_question(q: dict, index: int, total: int) -> str:
-    lines = [f"**Question {index + 1}/{total}** — {q['category']} ({q['difficulty']})", "", q["question"], ""]
-    lines += [f"- {choice}" for choice in q["choices"]]
-    return "\n".join(lines)
+API_SOURCE = "Open Trivia DB"
+WEB_SOURCE = "Web Search (agy)"
 
 
-def toggle_topic_box(source):
-    return gr.update(visible=(source == SOURCE_WEB))
+def show_question(state: dict) -> str:
+    """Format the current question as markdown."""
+    question = state["questions"][state["index"]]
+    choices = "\n".join(f"- {choice}" for choice in question["choices"])
+    return (
+        f"**Question {state['index'] + 1}/{len(state['questions'])}** "
+        f"--- {question['category']} ({question['difficulty']})\n\n"
+        f"{question['question']}\n\n{choices}"
+    )
 
 
-def start_quiz(source, topic, amount, history):
-    """Fetch a fresh batch of questions (from the chosen source) and post the first one to the chat."""
-    if source == SOURCE_WEB:
-        if not topic or not topic.strip():
-            history = [
-                {
-                    "role": "assistant",
-                    "content": "⚠️ Please enter a topic to search the web for, then click **Start Quiz** again.",
-                }
-            ]
-            return history, {}, gr.update()
+def start_quiz(source: str, topic: str, amount: float, history: list, state: dict):
+    """Start a quiz from the chosen source."""
+    amount = int(amount)
+    topic = topic.strip()
 
-        logger.info("Requesting web-search questions from agy for topic=%r", topic)
-        try:
-            questions = fetch_web_questions(topic.strip(), amount=int(amount), workspace=PROJECT_ROOT)
-        except Exception as e:
-            logger.error("agy failed to generate web questions: %s", e)
-            history = [{"role": "assistant", "content": f"⚠️ Couldn't generate questions from the web: {e}"}]
-            return history, {}, gr.update()
+    if source == WEB_SOURCE:
+        if not topic:
+            note = "Type a topic first, then press Start Quiz."
+            history = history + [{"role": "assistant", "content": note}]
+            return topic, history, state
 
-        intro = (
-            f"Let's play! I asked Antigravity to research **{topic.strip()}** and put together "
-            f"{len(questions)} questions — just type your answer in the box below.\n\n"
-        )
+        questions = fetch_web_questions(topic, amount)
+        described = f"the web, on {topic}"
     else:
-        questions = trivia_api.fetch_questions(amount=int(amount))
-        intro = f"Let's play! I'll ask you {len(questions)} questions from Open Trivia DB — just type your answer in the box below.\n\n"
+        questions = fetch_questions(amount)
+        described = API_SOURCE
 
-    state = {STATE_QUESTIONS: questions, STATE_INDEX: 0, STATE_SCORE: 0}
-    first_question = format_question(questions[0], 0, len(questions))
+    state = {"questions": questions, "index": 0, "score": 0}
+    intro = (
+        f"Let's play! I'll ask you {amount} questions from {described} "
+        "--- just type your answer in the box below."
+    )
+    history = history + [
+        {"role": "assistant", "content": f"{intro}\n\n{show_question(state)}"}
+    ]
+    return "", history, state
 
-    history = [{"role": "assistant", "content": intro + first_question}]
-    return history, state, gr.update(value="", interactive=True)
+def respond(message: str, history: list, state: dict):
+    """Handle one message from the player."""
+    if not message.strip():
+        return "", history, state
 
-
-def answer_question(message: str) -> str:
-    """Research a free-form question with agy and format the reply for the chat."""
-    logger.info("Answering free-form question via agy: %r", message)
-    try:
-        answer = ask_anything(message, workspace=PROJECT_ROOT, context=read_documents())
-    except Exception as e:
-        logger.error("agy failed to answer the question: %s", e)
-        return f"⚠️ {e}\n\nOr click **Start Quiz** above to play instead."
-
-    return f"{answer}\n\n<sub>Ask me anything else, or click **Start Quiz** above to play.</sub>"
-
-
-def respond(message, history, state):
-    """Handle one chat turn: judge the answer via agy, give feedback, ask the next question."""
     history = history + [{"role": "user", "content": message}]
 
-    quiz_running = state and state.get(STATE_QUESTIONS) and state[STATE_INDEX] < len(state[STATE_QUESTIONS])
+    if state["questions"]:
+        question = state["questions"][state["index"]]
+        correct, feedback = evaluate_answer(
+            question["question"], question["correct_answer"], message
+        )
+        if correct:
+            state["score"] += 1
 
-    if not quiz_running:
-        # No quiz in progress — treat the message as a question to research.
-        history.append({"role": "assistant", "content": answer_question(message)})
-        return history, state, ""
+        reply = ("Correct. " if correct else "Not quite. ") + feedback
+        state["index"] += 1
 
-    questions = state[STATE_QUESTIONS]
-    q = questions[state[STATE_INDEX]]
-
-    logger.info("Judging answer via agy for question index=%d", state[STATE_INDEX])
-    is_correct, feedback = evaluate_answer(q["question"], q["correct_answer"], message, workspace=PROJECT_ROOT)
-
-    if is_correct:
-        state[STATE_SCORE] += 1
-        prefix = "✅ **Correct!**"
+        if state["index"] < len(state["questions"]):
+            reply += "\n\n---\n\n" + show_question(state)
+        else:
+            total = len(state["questions"])
+            reply += f"\n\n---\n\n**Final score: {state['score']} / {total}**"
+            state = new_state()
     else:
-        prefix = f"❌ **Not quite** — the correct answer was **{q['correct_answer']}**."
+        reply = ask_anything(message, context=read_documents())
 
-    state[STATE_INDEX] += 1
-    reply = f"{prefix}\n\n{feedback}"
+    history = history + [{"role": "assistant", "content": reply}]
+    return "", history, state
 
-    if state[STATE_INDEX] < len(questions):
-        next_question = format_question(questions[state[STATE_INDEX]], state[STATE_INDEX], len(questions))
-        reply += f"\n\n---\n\n{next_question}"
-    else:
-        reply += f"\n\n---\n\n🎉 **Quiz complete!** Final score: **{state[STATE_SCORE]} / {len(questions)}**"
-
-    history.append({"role": "assistant", "content": reply})
-    return history, state, ""
-
-
-def build_interface() -> gr.Blocks:
+def build_interface():
     with gr.Blocks(title="Antigravity Trivia") as demo:
-        gr.Markdown(
-            "# 🧠 Antigravity Trivia\n"
-            "**Ask me anything** in the chat below — I'll answer from the documents in "
-            "`rag/` when they cover it, and search the web when they don't. "
-            "Or click **Start Quiz** to play."
+        gr.Markdown("# Antigravity Trivia\nAsk anything, or start a quiz.")
+
+        state = gr.State(new_state())
+
+        source = gr.Radio(
+            [API_SOURCE, WEB_SOURCE],
+            value=API_SOURCE,
+            label="Question source",
         )
 
         with gr.Row():
-            source = gr.Radio(
-                choices=[SOURCE_OPENTDB, SOURCE_WEB],
-                value=SOURCE_OPENTDB,
-                label="Question source",
+            topic = gr.Textbox(
+                placeholder="Topic (used for Web Search only)...",
+                show_label=False,
+                scale=3,
             )
-            amount = gr.Slider(minimum=3, maximum=20, value=5, step=1, label="Number of questions")
+            amount = gr.Slider(
+                minimum=1,
+                maximum=15,
+                value=DEFAULT_QUESTIONS,
+                step=1,
+                label="Questions",
+                scale=1,
+            )
 
-        topic = gr.Textbox(
-            label="Topic to search the web for",
-            placeholder="e.g. Ancient Rome, Formula 1, the James Webb Space Telescope",
-            visible=False,
-        )
+        start = gr.Button("Start Quiz", variant="primary")
 
-        start_btn = gr.Button("Start Quiz", variant="primary")
+        chatbot = gr.Chatbot(label="Trivia Chat", height=420)
+        box = gr.Textbox(label="Chat", placeholder="Type a question, or your answer...")
 
-        chatbot = gr.Chatbot(height=450, label="Trivia Chat")
-        msg = gr.Textbox(
-            label="Chat",
-            placeholder="Ask me anything, or type your answer when a quiz is running...",
-        )
-
-        state = gr.State({})
-
-        source.change(fn=toggle_topic_box, inputs=[source], outputs=[topic])
-
-        start_btn.click(
-            fn=start_quiz,
-            inputs=[source, topic, amount, chatbot],
-            outputs=[chatbot, state, msg],
-        )
-
-        msg.submit(
-            fn=respond,
-            inputs=[msg, chatbot, state],
-            outputs=[chatbot, state, msg],
+        box.submit(respond, [box, chatbot, state], [box, chatbot, state])
+        start.click(
+            start_quiz,
+            [source, topic, amount, chatbot, state],
+            [topic, chatbot, state],
         )
 
     return demo
-
-
-if __name__ == "__main__":
-    build_interface().launch(share=True)
